@@ -125,16 +125,71 @@ def build_net(home, prefix, work):
     return net
 
 
+# 실시간 인구(서울 도시데이터 121곳) → 사람이 많은 곳일수록 차가 더 많이 출발·도착
+PPL = None        # [(shapely 폴리곤, 인구), ...]  main 에서 채움
+PPL_REF = 20000.0  # 인구 2만 명 = 출발·도착 확률 +1배
+PPL_CAP = 8.0
+
+
+def load_ppl(ppl_file, hotspots_file):
+    from shapely.geometry import shape
+    d = json.load(open(ppl_file, encoding='utf-8'))
+    areas = d.get('areas', d)
+    out = []
+    for f in json.load(open(hotspots_file, encoding='utf-8'))['features']:
+        a = areas.get(f['properties'].get('AREA_CD'))
+        if a and a.get('p', 0) > 0:
+            out.append((shape(f['geometry']).buffer(0.0015), float(a['p']), f['properties'].get('AREA_NM')))
+    return out, d.get('t')
+
+
+def ppl_weights(home, net, work, base_args):
+    """randomTrips 기본 확률(차로·속도·외곽 유입)을 뽑은 뒤, 인구 많은 구역 도로에 배수를 곱해 다시 씀"""
+    import sumolib
+    from shapely.geometry import Point
+    rt = os.path.join(home, 'tools', 'randomTrips.py')
+    w0 = os.path.join(work, 'w0')
+    run([sys.executable, rt, '-n', net, '-o', os.path.join(work, 'w0.trips.xml'), '-b', '0', '-e', '1',
+         '--weights-output-prefix', w0] + base_args)
+    n = sumolib.net.readNet(net)
+    fac, hit = {}, {}
+    for e in n.getEdges():
+        sh = e.getShape()
+        x, y = sh[len(sh) // 2]
+        lon, lat = n.convertXY2LonLat(x, y)
+        pt, f = Point(lon, lat), 1.0
+        for poly, pop, nm in PPL:
+            if poly.contains(pt):
+                f += pop / PPL_REF
+                hit[nm] = pop
+        fac[e.getID()] = min(PPL_CAP, f)
+    w1 = os.path.join(work, 'w1')
+    for suf in ('.src.xml', '.dst.xml'):
+        tree = ET.parse(w0 + suf)
+        for el in tree.iter('edge'):
+            el.set('value', '%.6g' % (float(el.get('value', 0)) * fac.get(el.get('id'), 1.0)))
+        tree.write(w1 + suf)
+    log('실시간 인구 반영: 인구 구역 %d곳 (%s)' % (len(hit), ', '.join('%s %d' % (k, v) for k, v in sorted(hit.items(), key=lambda t: -t[1])[:5])))
+    return w1, hit
+
+
 def make_demand(home, net, work, minutes, density, seed):
     # minutes = 워밍업 포함 전체 시간
     trips = os.path.join(work, 'trips.trips.xml')
     rou = os.path.join(work, 'routes.rou.xml')
     rt = os.path.join(home, 'tools', 'randomTrips.py')
+    base = ['--lanes', '--speed-exponent', '1.5', '--fringe-factor', '8', '--seed', str(seed)]
+    extra = []
+    if PPL:
+        try:
+            w1, _ = ppl_weights(home, net, work, base)
+            extra = ['--weights-prefix', w1]
+        except Exception as e:
+            log('인구 반영 실패 → 도로 규모 기준만 사용:', e)
     run([sys.executable, rt, '-n', net, '-o', trips, '-r', rou, '-b', '0', '-e', str(minutes * 60),
-         '--insertion-density', str(density), '--lanes', '--speed-exponent', '1.5',
-         '--fringe-factor', '8', '--min-distance', '800', '--seed', str(seed), '--validate',
+         '--insertion-density', str(density), '--min-distance', '800', '--validate',
          '--trip-attributes', 'departLane="best" departSpeed="max"',
-         '--remove-loops'])
+         '--remove-loops'] + base + extra)
     return rou
 
 
@@ -397,6 +452,8 @@ def main():
     ap.add_argument('--ymd', default=None)
     ap.add_argument('--hh', default=None)
     ap.add_argument('--net-dir', default=None, help='미리 만든 도로망 폴더 (<구코드>.net.xml.gz)')
+    ap.add_argument('--ppl-file', default=None, help='실시간 인구 JSON (ppl_all.py 결과) - 사람 많은 곳에서 차가 더 출발·도착')
+    ap.add_argument('--hotspots', default=None, help='인구 구역 경계 (hotspots.json)')
     ap.add_argument('--buffer', type=float, default=2000, help='구 경계 바깥 도로 포함 범위(m) - 다리·경계 교통 반영')
     a = ap.parse_args()
     if not a.gu:
@@ -411,6 +468,15 @@ def main():
         a.nodelink = os.path.dirname(sorted(c)[-1])
     fix_proj()
     home = sumo_home()
+    global PPL
+    ppl_t = None
+    if a.ppl_file:
+        try:
+            PPL, ppl_t = load_ppl(a.ppl_file, a.hotspots or os.path.join(a.site, 'hotspots.json'))
+            log('실시간 인구 %d곳 불러옴 (%s)' % (len(PPL), ppl_t))
+        except Exception as e:
+            log('실시간 인구 불러오기 실패 → 인구 반영 없이:', e)
+            PPL = None
     for code in codes:
         work = os.path.join(HERE, 'work', code)
         shutil.rmtree(work, ignore_errors=True)
@@ -423,7 +489,7 @@ def main():
             prefix = cut_links(a.nodelink, os.path.join(a.site, 'seoul_gu.json'), code, work, a.buffer)
             net = build_net(home, prefix, work)
         import datetime
-        meta = {'calib': None, 'gen': (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')}
+        meta = {'ppl': ppl_t if PPL else None, 'calib': None, 'gen': (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')}
         counts = None
         if not a.no_calib:
             try:
