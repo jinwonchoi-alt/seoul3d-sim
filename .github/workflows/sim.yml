@@ -1,8 +1,8 @@
 name: seoul-sim
-# 2시간마다 서울시 검지기 실측 교통량으로 25개 구 시뮬레이션을 다시 만들어 GitHub Pages 에 올림
+# 1시간마다 서울시 검지기 실측 교통량으로 25개 구 시뮬레이션을 다시 만들어 GitHub Pages 에 올림
 on:
   schedule:
-    - cron: '17 */1 * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,12 +20,19 @@ jobs:
         with: { python-version: '3.12' }
       - run: pip install shapely pyproj
       - run: python counts_all.py --out counts_all.json
+      - name: 실시간 인구 (실패해도 계속)
+        run: python ppl_all.py --out ppl_all.json || echo '{}' > ppl_all.json
       - uses: actions/upload-artifact@v4
-        with: { name: counts, path: counts_all.json, retention-days: 1 }
+        with:
+          name: counts
+          retention-days: 1
+          path: |
+            counts_all.json
+            ppl_all.json
   sim:
     needs: counts
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 13
@@ -38,7 +45,7 @@ jobs:
       - run: pip install eclipse-sumo pyshp shapely pyproj
       - uses: actions/download-artifact@v4
         with: { name: counts }
-      - run: python sim_auto.py ${{ matrix.gu }} --net-dir nets --site . --counts-file counts_all.json
+      - run: python sim_auto.py ${{ matrix.gu }} --net-dir nets --site . --counts-file counts_all.json --ppl-file ppl_all.json --hotspots hotspots.json
       - uses: actions/upload-artifact@v4
         with: { name: 'sim-${{ matrix.gu }}', path: 'sim/${{ matrix.gu }}.json', retention-days: 1 }
   deploy:
