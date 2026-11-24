@@ -20,6 +20,7 @@ GU = {'종로구':'11110','중구':'11140','용산구':'11170','성동구':'1120
       '영등포구':'11560','동작구':'11590','관악구':'11620','서초구':'11650','강남구':'11680','송파구':'11710','강동구':'11740'}
 TM = '+proj=tmerc +lat_0=38 +lon_0=127 +k=1 +x_0=200000 +y_0=600000 +ellps=GRS80 +units=m +no_defs'
 HERE = os.path.dirname(os.path.abspath(__file__))
+FCD_DT = 3   # 차량 위치 기록 간격(초): 지도에서 사이를 부드럽게 이어 그림
 
 
 def log(*a):
@@ -143,13 +144,13 @@ def simulate(home, net, rou, work, minutes, warmup):
     with open(add, 'w') as f:
         f.write('<additional><edgeData id="md" file="meandata.xml" begin="%d" end="%d"/></additional>' % (warmup * 60, (warmup + minutes) * 60))
     run([tool(home, 'sumo'), '-n', net, '-r', rou, '--begin', '0', '--end', str((warmup + minutes) * 60),
-         '--fcd-output', fcd, '--fcd-output.geo', '--device.fcd.period', '2', '--device.fcd.begin', str(warmup * 60),
+         '--fcd-output', fcd, '--fcd-output.geo', '--device.fcd.period', str(FCD_DT), '--device.fcd.begin', str(warmup * 60),
          '--time-to-teleport', '120', '--ignore-route-errors', '--no-step-log', '--no-warnings',
          '--step-length', '1', '-a', add])
     return fcd
 
 
-def pack(fcd, out_json, code, minutes, net, warmup, meta=None):
+def pack(fcd, out_json, code, minutes, net, warmup, meta=None, gu_shape=None):
     """궤적 압축: 차량별 [시작초, lon*1e5, lat*1e5, 이후 (dlon,dlat,속도km/h) 반복], 2초 간격"""
     tracks = {}
     for ev, el in ET.iterparse(fcd, events=('end',)):
@@ -167,20 +168,37 @@ def pack(fcd, out_json, code, minutes, net, warmup, meta=None):
             tr['pts'].append((round(float(v.get('x')) * 1e5), round(float(v.get('y')) * 1e5),
                               round(float(v.get('speed')) * 3.6)))
         el.clear()
+    # 구 경계(+약 300m) 안에 있는 구간만 저장 (주변 도로는 계산에만 쓰고 파일은 작게)
+    inside = None
+    if gu_shape is not None:
+        from shapely.prepared import prep
+        from shapely.geometry import Point
+        pg = prep(gu_shape.buffer(0.003))
+        inside = lambda x, y: pg.contains(Point(x / 1e5, y / 1e5))
     vehs, npts = [], 0
     for tr in tracks.values():
-        p = tr['pts']
-        if len(p) < 2:
-            continue
-        arr = [tr['t0'], p[0][0], p[0][1], p[0][2]]
-        for a, b in zip(p, p[1:]):
-            arr += [b[0] - a[0], b[1] - a[1], b[2]]
-        vehs.append(arr)
-        npts += len(p)
+        runs, cur, t = [], [], tr['t0']
+        for i, q in enumerate(tr['pts']):
+            if inside is None or inside(q[0], q[1]):
+                if not cur:
+                    cur_t0 = tr['t0'] + i * FCD_DT
+                cur.append(q)
+            elif cur:
+                runs.append((cur_t0, cur)); cur = []
+        if cur:
+            runs.append((cur_t0, cur))
+        for t0, p in runs:
+            if len(p) < 2:
+                continue
+            arr = [t0, p[0][0], p[0][1], p[0][2]]
+            for a, b in zip(p, p[1:]):
+                arr += [b[0] - a[0], b[1] - a[1], b[2]]
+            vehs.append(arr)
+            npts += len(p)
     # 도로망 경계 (카메라 이동용)
     xs = [v[1] for v in vehs] or [0]
     ys = [v[2] for v in vehs] or [0]
-    data = {'gu': code, 'dt': 2, 'dur': minutes * 60, 'scale': 1e5,
+    data = {'gu': code, 'dt': FCD_DT, 'dur': minutes * 60, 'scale': 1e5,
             'bbox': [min(xs) / 1e5, min(ys) / 1e5, max(xs) / 1e5, max(ys) / 1e5], 'v': vehs}
     if meta:
         data.update(meta)
@@ -355,6 +373,15 @@ def ask_gu(allow_all=False):
         print('1~25 사이 번호를 입력하세요.')
 
 
+def gu_shape_of(gu_json, code):
+    try:
+        from shapely.geometry import shape
+        from shapely.ops import unary_union
+        return unary_union([shape(f['geometry']) for f in json.load(open(gu_json, encoding='utf-8'))['features'] if str(f['properties'].get('sig')) == code])
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('gu', nargs='?', default=None, help='구 이름(강남구), 구코드(11680) 또는 all')
@@ -370,7 +397,7 @@ def main():
     ap.add_argument('--ymd', default=None)
     ap.add_argument('--hh', default=None)
     ap.add_argument('--net-dir', default=None, help='미리 만든 도로망 폴더 (<구코드>.net.xml.gz)')
-    ap.add_argument('--buffer', type=float, default=150, help='구 경계 바깥 여유(m)')
+    ap.add_argument('--buffer', type=float, default=2000, help='구 경계 바깥 도로 포함 범위(m) - 다리·경계 교통 반영')
     a = ap.parse_args()
     if not a.gu:
         a.gu = ask_gu(True)
@@ -439,7 +466,7 @@ def main():
             for r in res:
                 log('  %-16s 관측 %5d대/h  시뮬 %5d대/h' % (r['nm'], r['obs'], r['sim']))
             log('보정 결과: 시뮬/관측 합계 %d%%' % (100 * sum(r['sim'] for r in res) / max(1, sum(r['obs'] for r in res))))
-        pack(fcd, os.path.join(a.site, 'sim', code + '.json'), code, a.minutes, net, a.warmup, meta)
+        pack(fcd, os.path.join(a.site, 'sim', code + '.json'), code, a.minutes, net, a.warmup, meta, gu_shape_of(os.path.join(a.site, 'seoul_gu.json'), code))
         os.remove(fcd)
     log('완료. 3D 지도에서 [시뮬레이션] 레이어를 켜세요.')
 
