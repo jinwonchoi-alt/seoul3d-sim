@@ -120,6 +120,28 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with: { path: fccache, key: 'fc-${{ github.run_id }}' }
+      - uses: actions/checkout@v4
+        with: { path: repo }
+      - id: wk
+        run: echo "w=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      # 방범 CCTV 위치(서울 약 5만 곳): 원본 API가 느리고 동시 요청에 멈춰서, 일주일에 한 번만 천천히 받아 구별 파일로 → site/cctv/<구코드>.json
+      - uses: actions/cache@v4
+        with: { path: cctvcache, key: 'cctv-${{ steps.wk.outputs.w }}', restore-keys: 'cctv-' }
+      - name: 방범 CCTV 구별 파일 (이번 주 것이 없을 때만 받기)
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          W="${{ steps.wk.outputs.w }}"; mkdir -p cctvcache site/cctv
+          if [ "$(cat cctvcache/week 2>/dev/null)" != "$W" ] || [ ! -f cctvcache/done ]; then
+            mkdir -p cctvnew
+            [ "$(cat cctvcache/week 2>/dev/null)" = "$W" ] && cp cctvcache/*.json cctvnew/ 2>/dev/null
+            python3 repo/cctv_all.py --out cctvnew || true
+            cp cctvnew/*.json cctvcache/ 2>/dev/null || true
+            echo "$W" > cctvcache/week
+            if [ -f cctvnew/done ]; then touch cctvcache/done; else rm -f cctvcache/done; fi
+          fi
+          cp cctvcache/*.json site/cctv/ 2>/dev/null || true
+          ls site/cctv | wc -l
       - name: 실패한 구는 이전 결과 유지
         run: |
           BASE="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/sim"
