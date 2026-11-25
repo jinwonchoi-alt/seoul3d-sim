@@ -164,5 +164,12 @@ jobs:
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with: { path: site }
+      # GitHub 쪽 일시 오류("No artifacts named github-pages")로 가끔 실패 → 30초 뒤 한 번 더
       - id: dep
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - if: steps.dep.outcome == 'failure'
+        run: sleep 30
+      - id: dep2
+        if: steps.dep.outcome == 'failure'
         uses: actions/deploy-pages@v4
