@@ -31,6 +31,7 @@ def main():
     ap.add_argument('--out', default='ppl_all.json')
     ap.add_argument('--targets', default='', help='예측 시뮬레이션 시각 고르기 (예측 목록 순번, 예: 1,2,12)')
     ap.add_argument('--targets-out', default='fc_targets.txt')
+    ap.add_argument('--have', default='fc_have.json', help='이미 배포된 sim/fc/index.json (빈 시각 찾기용, 없어도 됨)')
     a = ap.parse_args()
     codes = [f['properties']['AREA_CD'] for f in json.load(open(a.hotspots, encoding='utf-8'))['features']]
     with ThreadPoolExecutor(6) as ex:
@@ -43,8 +44,26 @@ def main():
     if a.targets:
         # 예측 시뮬레이션을 돌릴 시각: 예측 목록에서 몇 번째(1부터)를 고를지. 예) 1,2,12 → 가까운 2개는 매시간 새로, 12시간 뒤는 처음 만듦
         pick = []
-        for k in a.targets.split(','):
-            k = int(k)
+        ks = [int(k) for k in a.targets.split(',') if k.strip()]
+        # 빈 시각부터: 이미 배포된 예측 목록(--have)에서 25개 구가 다 갖추지 못한 시각을 먼저 고름
+        # (GitHub 가 정기 실행을 가끔 건너뛰어 생긴 구멍을 다음 실행이 메움). 1번째(가장 가까운 시각)는 항상 새로
+        if fc and 1 in ks:
+            pick.append(fc[0])
+        have = {}
+        try:
+            for gu in (json.load(open(a.have, encoding='utf-8')).get('fc') or {}).values():
+                for at in gu.values():
+                    have[at] = have.get(at, 0) + 1
+        except Exception:
+            pass
+        for t_ in fc:
+            if len(pick) >= len(ks):
+                break
+            if have.get(t_, 0) < 25 and t_ not in pick:
+                pick.append(t_)
+        for k in ks:   # 빈 곳이 없으면 원래 순번(가까운 시각 새로 고침 등)으로 채움
+            if len(pick) >= len(ks):
+                break
             if 1 <= k <= len(fc) and fc[k - 1] not in pick:
                 pick.append(fc[k - 1])
         open(a.targets_out, 'w').write('\n'.join(pick) + ('\n' if pick else ''))
