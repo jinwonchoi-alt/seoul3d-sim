@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""서울 25개 구의 교통량 검지기 지점 + 최근 1시간 교통량을 한 번에 받아 counts_all.json 으로 저장"""
+"""서울 25개 구의 교통량 검지기 지점 + 최근 1시간 교통량을 한 번에 받아 counts_all.json 으로 저장
+   --at "YYYY-MM-DD HH:00" 이면 예측용: 그 시각과 같은 요일·같은 시간의 지난주(없으면 2주 전, 전날) 실측 교통량"""
 import os, sys, json, argparse, datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sim_auto as A
@@ -10,6 +11,7 @@ def main():
     ap.add_argument('--api', default=A.API_DEFAULT)
     ap.add_argument('--gu-json', default='seoul_gu.json')
     ap.add_argument('--out', default='counts_all.json')
+    ap.add_argument('--at', default=None, help='예측 시각 "YYYY-MM-DD HH:00" (지난주 같은 요일·시각 교통량 사용)')
     a = ap.parse_args()
     from shapely.geometry import shape, Point
     from pyproj import Transformer
@@ -25,8 +27,12 @@ def main():
         spots.append({'id': r['id'], 'nm': r['nm'], 'lon': round(lon, 6), 'lat': round(lat, 6)})
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     vol, ymd, hh = {}, '', ''
-    for back in (1, 2, 3, 24):
-        t = now - datetime.timedelta(hours=back)
+    if a.at:
+        at = datetime.datetime.strptime(a.at[:13], '%Y-%m-%d %H')
+        backs = [at - datetime.timedelta(days=d) for d in (7, 14, 1)]
+    else:
+        backs = [now - datetime.timedelta(hours=b) for b in (1, 2, 3, 24)]
+    for t in backs:
         y, h = t.strftime('%Y%m%d'), t.strftime('%H')
         got = {}
         for i in range(0, len(spots), 40):

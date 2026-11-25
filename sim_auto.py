@@ -129,18 +129,27 @@ def build_net(home, prefix, work):
 PPL = None        # [(shapely 폴리곤, 인구), ...]  main 에서 채움
 PPL_REF = 20000.0  # 인구 2만 명 = 출발·도착 확률 +1배
 PPL_CAP = 8.0
+PPL_HIT = {}      # 이번 구에서 반영된 인구 구역 {이름: 인구}
 
 
-def load_ppl(ppl_file, hotspots_file):
+def load_ppl(ppl_file, hotspots_file, at=None):
+    """at 을 주면 그 시각의 예측 인구(ppl_all.json 의 f)를 씀. 예측이 없는 구역은 빼고 계산"""
     from shapely.geometry import shape
     d = json.load(open(ppl_file, encoding='utf-8'))
     areas = d.get('areas', d)
     out = []
     for f in json.load(open(hotspots_file, encoding='utf-8'))['features']:
         a = areas.get(f['properties'].get('AREA_CD'))
-        if a and a.get('p', 0) > 0:
-            out.append((shape(f['geometry']).buffer(0.0015), float(a['p']), f['properties'].get('AREA_NM')))
-    return out, d.get('t')
+        if not a:
+            continue
+        if at:
+            v = (a.get('f') or {}).get(at)
+            p = float(v[0]) if v else 0
+        else:
+            p = float(a.get('p', 0))
+        if p > 0:
+            out.append((shape(f['geometry']).buffer(0.0015), p, f['properties'].get('AREA_NM')))
+    return out, (at or d.get('t'))
 
 
 def ppl_weights(home, net, work, base_args):
@@ -182,7 +191,9 @@ def make_demand(home, net, work, minutes, density, seed):
     extra = []
     if PPL:
         try:
-            w1, _ = ppl_weights(home, net, work, base)
+            w1, hit = ppl_weights(home, net, work, base)
+            PPL_HIT.clear()
+            PPL_HIT.update(hit)
             extra = ['--weights-prefix', w1]
         except Exception as e:
             log('인구 반영 실패 → 도로 규모 기준만 사용:', e)
@@ -257,9 +268,14 @@ def pack(fcd, out_json, code, minutes, net, warmup, meta=None, gu_shape=None):
             'bbox': [min(xs) / 1e5, min(ys) / 1e5, max(xs) / 1e5, max(ys) / 1e5], 'v': vehs}
     if meta:
         data.update(meta)
-    os.makedirs(os.path.dirname(out_json), exist_ok=True)
-    with open(out_json, 'w') as f:
-        json.dump(data, f, separators=(',', ':'))
+    os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
+    if out_json.endswith('.gz'):
+        import gzip
+        with gzip.open(out_json, 'wt', compresslevel=9) as f:
+            json.dump(data, f, separators=(',', ':'))
+    else:
+        with open(out_json, 'w') as f:
+            json.dump(data, f, separators=(',', ':'))
     log('차량', len(vehs), '대 / 위치점', npts, '개 →', out_json, '(%.1f MB)' % (os.path.getsize(out_json) / 1e6))
 
 
@@ -349,6 +365,9 @@ def route_edge_counts(rou):
     return cnt
 
 
+MAX_SCALE = 1.2   # 관측/기본 비율을 투입 총량에 반영하는 상한 (--max-scale)
+
+
 def calibrate(home, net, work, minutes, density, seed, counts, boost=None):
     """후보 경로를 넉넉히 만든 뒤, 관측 교통량에 맞게 경로를 골라냄 (SUMO routeSampler)"""
     spots = counts['spots']
@@ -394,7 +413,7 @@ def calibrate(home, net, work, minutes, density, seed, counts, boost=None):
         f.write('  </interval>\n</data>\n')
     out = os.path.join(work, 'calibrated.rou.xml')
     run([sys.executable, os.path.join(home, 'tools', 'routeSampler.py'), '-r', cand, '-d', cnt_file,
-         '-o', out, '--total-count', str(int(nbase * min(1.2, max(0.8, r)))), '--seed', str(seed),
+         '-o', out, '--total-count', str(int(nbase * min(MAX_SCALE, max(0.8, r)))), '--seed', str(seed),
          '-a', 'departLane="best" departSpeed="max"', '--mismatch-output', os.path.join(work, 'mismatch.xml')])
     return out
 
@@ -455,6 +474,12 @@ def main():
     ap.add_argument('--ppl-file', default=None, help='실시간 인구 JSON (ppl_all.py 결과) - 사람 많은 곳에서 차가 더 출발·도착')
     ap.add_argument('--hotspots', default=None, help='인구 구역 경계 (hotspots.json)')
     ap.add_argument('--buffer', type=float, default=2000, help='구 경계 바깥 도로 포함 범위(m) - 다리·경계 교통 반영')
+    ap.add_argument('--ppl-at', default=None, help='예측 시뮬레이션: 이 시각("YYYY-MM-DD HH:00")의 예측 인구 사용')
+    ap.add_argument('--out', default=None, help='결과 파일 경로 (기본 <site>/sim/<구코드>.json, .gz 로 끝나면 압축 저장)')
+    ap.add_argument('--fast', action='store_true', help='2차 보정 생략 (예측 시뮬레이션용, 시간 절반)')
+    ap.add_argument('--fcd-dt', type=int, default=3, help='차량 위치 기록 간격(초). 크게 하면 파일이 작아짐')
+    ap.add_argument('--fast-boost', type=float, default=1.8, help='--fast 일 때 관측 목표 배수')
+    ap.add_argument('--max-scale', type=float, default=1.2, help='투입 총량 상한 배수 (출퇴근 등 교통량 많은 시각은 크게)')
     a = ap.parse_args()
     if not a.gu:
         a.gu = ask_gu(True)
@@ -468,11 +493,13 @@ def main():
         a.nodelink = os.path.dirname(sorted(c)[-1])
     fix_proj()
     home = sumo_home()
-    global PPL
+    global PPL, MAX_SCALE, FCD_DT
+    MAX_SCALE = a.max_scale
+    FCD_DT = max(1, a.fcd_dt)
     ppl_t = None
     if a.ppl_file:
         try:
-            PPL, ppl_t = load_ppl(a.ppl_file, a.hotspots or os.path.join(a.site, 'hotspots.json'))
+            PPL, ppl_t = load_ppl(a.ppl_file, a.hotspots or os.path.join(a.site, 'hotspots.json'), a.ppl_at)
             log('실시간 인구 %d곳 불러옴 (%s)' % (len(PPL), ppl_t))
         except Exception as e:
             log('실시간 인구 불러오기 실패 → 인구 반영 없이:', e)
@@ -490,6 +517,9 @@ def main():
             net = build_net(home, prefix, work)
         import datetime
         meta = {'ppl': ppl_t if PPL else None, 'calib': None, 'gen': (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')}
+        if a.ppl_at:
+            meta['fc'] = a.ppl_at   # 예측 시뮬레이션 대상 시각
+        PPL_HIT.clear()
         counts = None
         if not a.no_calib:
             try:
@@ -505,12 +535,18 @@ def main():
         spots = map_spots(home, net, counts['spots']) if counts and counts.get('spots') else []
         if spots:
             log('교통량 지점 %d곳 (%s %s시 기준)으로 보정' % (len(spots), counts['ymd'], counts['hh']))
-            rou = calibrate(home, net, work, a.warmup + a.minutes, a.density, a.seed, dict(counts, spots=spots))
+            # --fast: 2차 보정 대신, 1차 보정에서 보통 모자라는 만큼(약 0.55배) 미리 목표를 높여 한 번에 맞춤
+            pre = {s_['id']: a.fast_boost for s_ in spots} if a.fast else None
+            rou = calibrate(home, net, work, a.warmup + a.minutes, a.density, a.seed, dict(counts, spots=spots), pre)
         else:
             log('이 구에는 교통량 지점이 없거나 받지 못함 → 도로 규모 기준 수요만 사용')
             rou = make_demand(home, net, work, a.warmup + a.minutes, a.density, a.seed)
         fcd = simulate(home, net, rou, work, a.minutes, a.warmup)
-        if spots:
+        if spots and a.fast:
+            res = measure_spots(os.path.join(work, 'meandata.xml'), spots, a.warmup, a.minutes)
+            meta['calib'] = {'ymd': counts['ymd'], 'hh': counts['hh'], 'spots': res}
+            log('보정 결과(1차만): 시뮬/관측 합계 %d%%' % (100 * sum(r['sim'] for r in res) / max(1, sum(r['obs'] for r in res))))
+        elif spots:
             res = measure_spots(os.path.join(work, 'meandata.xml'), spots, a.warmup, a.minutes)
             # 2차 보정: 1차 결과에서 모자란 지점은 목표를 높여 한 번 더 (최대 2배)
             boost = {}
@@ -532,7 +568,10 @@ def main():
             for r in res:
                 log('  %-16s 관측 %5d대/h  시뮬 %5d대/h' % (r['nm'], r['obs'], r['sim']))
             log('보정 결과: 시뮬/관측 합계 %d%%' % (100 * sum(r['sim'] for r in res) / max(1, sum(r['obs'] for r in res))))
-        pack(fcd, os.path.join(a.site, 'sim', code + '.json'), code, a.minutes, net, a.warmup, meta, gu_shape_of(os.path.join(a.site, 'seoul_gu.json'), code))
+        if PPL_HIT:
+            meta['pplTop'] = [[k, int(v)] for k, v in sorted(PPL_HIT.items(), key=lambda t: -t[1])[:6]]
+        out = a.out.replace('{gu}', code) if a.out else os.path.join(a.site, 'sim', code + '.json')
+        pack(fcd, out, code, a.minutes, net, a.warmup, meta, gu_shape_of(os.path.join(a.site, 'seoul_gu.json'), code))
         os.remove(fcd)
     log('완료. 3D 지도에서 [시뮬레이션] 레이어를 켜세요.')
 
