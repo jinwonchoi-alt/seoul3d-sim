@@ -5,7 +5,7 @@ name: seoul-sim
 #   → sim/fc/<구코드>_<HH>.json.gz , 목록 sim/fc/index.json
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '17,47 * * * *'   # 30분마다 (GitHub 가 정기 실행을 가끔 건너뛰어서, 한 번 빠져도 30분 뒤 다시)
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,7 +25,8 @@ jobs:
       - run: python counts_all.py --out counts_all.json
       - name: 실시간 인구 + 예측 시각 (실패해도 계속)
         run: |
-          python ppl_all.py --out ppl_all.json --targets 1,2,12 --targets-out fc_targets.txt || { echo '{}' > ppl_all.json; rm -f fc_targets.txt; touch fc_targets.txt; }
+          curl -sf "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/sim/fc/index.json" -o fc_have.json || echo '{}' > fc_have.json
+          python ppl_all.py --out ppl_all.json --targets 1,2,12 --targets-out fc_targets.txt --have fc_have.json || { echo '{}' > ppl_all.json; rm -f fc_targets.txt; touch fc_targets.txt; }
       - name: 예측 시각별 교통량 (지난주 같은 요일·시각, 실패해도 계속)
         run: |
           touch fc_targets.txt
