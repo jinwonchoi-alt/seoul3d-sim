@@ -1,5 +1,8 @@
 name: seoul-sim
 # 1시간마다 서울시 검지기 실측 교통량으로 25개 구 시뮬레이션을 다시 만들어 GitHub Pages 에 올림
+# + 예측 시뮬레이션: 서울 도시데이터 예측 인구(1~12시간 뒤) + 지난주 같은 요일·시각 교통량
+#   매시간 예측 목록의 1·2번째(가까운 시각)와 12번째(새로 들어온 시각)를 만들고, 나머지는 이전 결과를 캐시로 이어 씀
+#   → sim/fc/<구코드>_<HH>.json.gz , 목록 sim/fc/index.json
 on:
   schedule:
     - cron: '17 * * * *'
@@ -20,8 +23,18 @@ jobs:
         with: { python-version: '3.12' }
       - run: pip install shapely pyproj
       - run: python counts_all.py --out counts_all.json
-      - name: 실시간 인구 (실패해도 계속)
-        run: python ppl_all.py --out ppl_all.json || echo '{}' > ppl_all.json
+      - name: 실시간 인구 + 예측 시각 (실패해도 계속)
+        run: |
+          python ppl_all.py --out ppl_all.json --targets 1,2,12 --targets-out fc_targets.txt || { echo '{}' > ppl_all.json; rm -f fc_targets.txt; touch fc_targets.txt; }
+      - name: 예측 시각별 교통량 (지난주 같은 요일·시각, 실패해도 계속)
+        run: |
+          touch fc_targets.txt
+          while read -r T; do
+            [ -n "$T" ] || continue
+            HH=${T:11:2}
+            python counts_all.py --at "$T" --out counts_fc_$HH.json || echo "교통량 실패: $T"
+          done < fc_targets.txt
+          cat fc_targets.txt
       - uses: actions/upload-artifact@v4
         with:
           name: counts
@@ -29,13 +42,15 @@ jobs:
           path: |
             counts_all.json
             ppl_all.json
+            fc_targets.txt
+            counts_fc_*.json
   sim:
     needs: counts
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 13
+      max-parallel: 20
       matrix:
         gu: [ 11110, 11140, 11170, 11200, 11215, 11230, 11260, 11290, 11305, 11320, 11350, 11380, 11410, 11440, 11470, 11500, 11530, 11545, 11560, 11590, 11620, 11650, 11680, 11710, 11740 ]
     steps:
@@ -48,6 +63,23 @@ jobs:
       - run: python sim_auto.py ${{ matrix.gu }} --net-dir nets --site . --counts-file counts_all.json --ppl-file ppl_all.json --hotspots hotspots.json
       - uses: actions/upload-artifact@v4
         with: { name: 'sim-${{ matrix.gu }}', path: 'sim/${{ matrix.gu }}.json', retention-days: 1 }
+      - name: 예측 시뮬레이션 (예측 인구 + 지난주 같은 시각 교통량, 5분 기록)
+        timeout-minutes: 25
+        continue-on-error: true
+        run: |
+          mkdir -p sim/fc
+          touch fc_targets.txt
+          while read -r T; do
+            [ -n "$T" ] || continue
+            HH=${T:11:2}
+            CF=counts_fc_$HH.json; [ -f $CF ] || CF=counts_all.json
+            python sim_auto.py ${{ matrix.gu }} --net-dir nets --site . --counts-file $CF --ppl-file ppl_all.json --hotspots hotspots.json \
+              --ppl-at "$T" --minutes 5 --fast --max-scale 2 --fcd-dt 6 --out "sim/fc/${{ matrix.gu }}_$HH.json.gz" || echo "예측 실패: $T"
+          done < fc_targets.txt
+          ls -la sim/fc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: 'simfc-${{ matrix.gu }}', path: 'sim/fc/*.json.gz', retention-days: 1, if-no-files-found: ignore }
   deploy:
     needs: sim
     if: always()
@@ -56,8 +88,38 @@ jobs:
       name: github-pages
       url: ${{ steps.dep.outputs.page_url }}
     steps:
+      - name: 이전 예측 결과 (캐시)
+        uses: actions/cache/restore@v4
+        with: { path: fccache, key: 'fc-${{ github.run_id }}', restore-keys: 'fc-' }
+      - run: mkdir -p site/sim/fc fccache && cp -f fccache/*.json.gz site/sim/fc/ 2>/dev/null || true
       - uses: actions/download-artifact@v4
         with: { pattern: 'sim-*', merge-multiple: true, path: site/sim }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { pattern: 'simfc-*', merge-multiple: true, path: site/sim/fc }
+      - name: 지난 시각 예측은 지우고 목록 만들기
+        run: |
+          python3 - <<'PY'
+          import json, os, glob, gzip, datetime
+          now = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:00')
+          idx = {}
+          for f in sorted(glob.glob('site/sim/fc/*.json.gz')):
+              try:
+                  at = json.load(gzip.open(f)).get('fc') or ''
+              except Exception:
+                  at = ''
+              if not at or at < now:
+                  os.remove(f); continue
+              code, hh = os.path.basename(f)[:-8].split('_')
+              idx.setdefault(code, {})[hh] = at
+          json.dump({'gen': now, 'fc': idx}, open('site/sim/fc/index.json', 'w'))
+          print('예측 시뮬레이션', sum(len(v) for v in idx.values()), '개', {k: sorted(v) for k, v in idx.items()})
+          PY
+          rm -rf fccache && mkdir -p fccache && cp site/sim/fc/*.json.gz fccache/ 2>/dev/null || true
+      - name: 예측 결과 캐시 저장
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with: { path: fccache, key: 'fc-${{ github.run_id }}' }
       - name: 실패한 구는 이전 결과 유지
         run: |
           BASE="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/sim"
