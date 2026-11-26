@@ -20,6 +20,15 @@ GU = {'종로구':'11110','중구':'11140','용산구':'11170','성동구':'1120
       '영등포구':'11560','동작구':'11590','관악구':'11620','서초구':'11650','강남구':'11680','송파구':'11710','강동구':'11740'}
 TM = '+proj=tmerc +lat_0=38 +lon_0=127 +k=1 +x_0=200000 +y_0=600000 +ellps=GRS80 +units=m +no_defs'
 HERE = os.path.dirname(os.path.abspath(__file__))
+TLS_ACT = False
+MEAS = None   # 교통량 재는 시간(분)
+PASSES = 3    # 새 보정 반복 횟수
+TARGET = {}   # 지점 도로별 관측 교통량(대/시) — 2차 보정용
+TTT = 120
+CALIB_GAIN = 1.25
+TR_DMIN = 600
+TR_DMAX = 2500
+JB = []
 FCD_DT = 3   # 차량 위치 기록 간격(초): 지도에서 사이를 부드럽게 이어 그림
 
 
@@ -204,14 +213,45 @@ def make_demand(home, net, work, minutes, density, seed):
     return rou
 
 
+def tls_actuated(home, net_file, out_file, max_green=60):
+    """모든 신호를 '감응식'(차가 많은 방향에 초록불을 더 주는 방식)으로 바꾸는 추가 파일.
+       도로망을 만들 때 생긴 기본 신호는 방향마다 초록불을 똑같이 나눠 큰길이 막혔음 (관측의 60%밖에 못 흘림)"""
+    sumolib = sumolib_of(home)
+    net = sumolib.net.readNet(net_file, withPrograms=True)
+    n = 0
+    with open(out_file, 'w') as f:
+        f.write('<additional>\n')
+        for tl in net.getTrafficLights():
+            for pid, prog in tl.getPrograms().items():
+                f.write('  <tlLogic id="%s" programID="act" type="actuated" offset="0">\n' % tl.getID())
+                for ph in prog.getPhases():
+                    st = ph.state
+                    green = ('G' in st or 'g' in st) and 'y' not in st
+                    if green:
+                        f.write('    <phase duration="%d" minDur="6" maxDur="%d" state="%s"/>\n' % (max(10, ph.duration), max_green, st))
+                    else:
+                        f.write('    <phase duration="%d" state="%s"/>\n' % (ph.duration, st))
+                f.write('  </tlLogic>\n')
+                n += 1
+                break
+        f.write('</additional>\n')
+    return n
+
 def simulate(home, net, rou, work, minutes, warmup):
+    """교통량은 워밍업 뒤 MEAS분 동안 재고(짧게 재면 우연에 흔들림), 지도용 차량 위치는 마지막 minutes분만 기록"""
+    M = max(minutes, MEAS or minutes)
     fcd = os.path.join(work, 'fcd.xml')
     add = os.path.join(work, 'meandata.add.xml')
     with open(add, 'w') as f:
-        f.write('<additional><edgeData id="md" file="meandata.xml" begin="%d" end="%d"/></additional>' % (warmup * 60, (warmup + minutes) * 60))
-    run([tool(home, 'sumo'), '-n', net, '-r', rou, '--begin', '0', '--end', str((warmup + minutes) * 60),
-         '--fcd-output', fcd, '--fcd-output.geo', '--device.fcd.period', str(FCD_DT), '--device.fcd.begin', str(warmup * 60),
-         '--time-to-teleport', '120', '--ignore-route-errors', '--no-step-log', '--no-warnings',
+        f.write('<additional><edgeData id="md" file="meandata.xml" begin="%d" end="%d"/></additional>' % (warmup * 60, (warmup + M) * 60))
+    if TLS_ACT:
+        tla = os.path.join(work, 'tls_act.add.xml')
+        if not os.path.exists(tla):
+            log('신호 %d곳을 감응식으로' % tls_actuated(home, net, tla))
+        add = add + ',' + tla
+    run([tool(home, 'sumo'), '-n', net, '-r', rou, '--begin', '0', '--end', str((warmup + M) * 60),
+         '--fcd-output', fcd, '--fcd-output.geo', '--device.fcd.period', str(FCD_DT), '--device.fcd.begin', str((warmup + M - minutes) * 60),
+         '--time-to-teleport', str(TTT), '--ignore-route-errors'] + JB + [ '--no-step-log', '--no-warnings',
          '--step-length', '1', '-a', add])
     return fcd
 
@@ -332,25 +372,47 @@ def sumolib_of(home):
 
 
 def map_spots(home, net_file, spots):
-    """지점마다 가까운 도로(양방향 2개 edge)를 찾음"""
+    """지점마다 해당 도로(양방향 2개 edge)를 찾음.
+       예전엔 '가장 가까운 도로'라서 큰길 옆 골목(시흥대로4길)이나 끊긴 지하도로가 잡혀 교통량이 크게 모자랐음
+       → 지점 이름의 도로명과 같은 도로를 먼저, 없으면 차로 많은 도로를 고르고, 너무 짧거나 어디에도 안 이어진 도로는 뺌"""
+    import re
     sumolib = sumolib_of(home)
     net = sumolib.net.readNet(net_file)
     for s in spots:
         x, y = net.convertLonLat2XY(s['lon'], s['lat'])
-        cand = [(e, d) for e, d in net.getNeighboringEdges(x, y, 60) if e.getFunction() != 'internal']
-        cand.sort(key=lambda t: t[1])
-        s['edges'] = []
-        if not cand:
+        road = re.sub(r'\(.*', '', s['nm']).replace(' ', '')
+        key = road[:4] if len(road) >= 4 else road
+        def usable(e):
+            return e.getFunction() != 'internal' and e.allows('passenger') and e.getLength() >= 8 and (e.getIncoming() or e.getOutgoing())
+        cand = [(e, d) for e, d in net.getNeighboringEdges(x, y, 150) if usable(e)]
+        named = [(e, d) for e, d in cand if key and key in (e.getName() or '').replace(' ', '')]
+        if named:
+            pool = named
+        else:
+            near = [(e, d) for e, d in cand if d <= 60]
+            big = [(e, d) for e, d in near if e.getLaneNumber() >= 2]
+            pool = big or near
+        if not pool:
+            s['edges'] = []
             continue
-        a = cand[0][0]
-        s['edges'].append(a.getID())
+        # 가까우면서 큰 도로 (거리 1m = 차로 0.05개)
+        pool.sort(key=lambda t: t[1] - 20 * min(t[0].getLaneNumber(), 5))
+        a = pool[0][0]
+        s['edges'] = [a.getID()]
         fa, ta = a.getFromNode().getID(), a.getToNode().getID()
-        for e, d in cand[1:]:
-            # 반대 방향: 출발/도착 노드가 뒤바뀐 도로, 없으면 가까운 다른 방향 도로
-            if (e.getFromNode().getID() == ta and e.getToNode().getID() == fa) or d < 40:
-                if e.getID() not in s['edges']:
-                    s['edges'].append(e.getID())
-                    break
+        ax, ay = a.getToNode().getCoord()[0] - a.getFromNode().getCoord()[0], a.getToNode().getCoord()[1] - a.getFromNode().getCoord()[1]
+        best = None
+        for e, d in pool[1:] + [t for t in cand if t not in pool]:
+            if e.getID() == a.getID():
+                continue
+            if e.getFromNode().getID() == ta and e.getToNode().getID() == fa:
+                best = e
+                break
+            bx, by = e.getToNode().getCoord()[0] - e.getFromNode().getCoord()[0], e.getToNode().getCoord()[1] - e.getFromNode().getCoord()[1]
+            if best is None and d < 60 and ax * bx + ay * by < 0 and (not named or (e, d) in named):   # 반대 방향
+                best = e
+        if best is not None:
+            s['edges'].append(best.getID())
     return [s for s in spots if s['edges']]
 
 
@@ -418,6 +480,129 @@ def calibrate(home, net, work, minutes, density, seed, counts, boost=None):
     return out
 
 
+def through_routes(home, net_file, edges, out_file, per_edge=80, seed=1, dmin=None, dmax=None):
+    dmin = dmin or TR_DMIN; dmax = dmax or TR_DMAX
+    """관측 지점 도로를 반드시 지나는 후보 경로: 지점 위쪽 0.6~2.5km 에서 출발해 지점을 지나 아래쪽 0.6~2.5km 로 (큰길 교통량이 모자라던 문제 보완)"""
+    import random
+    from collections import deque
+    sumolib = sumolib_of(home)
+    net = sumolib.net.readNet(net_file)
+    rnd = random.Random(seed)
+    ok0 = lambda e: e.getFunction() != 'internal' and e.allows('passenger')
+    def bfs(start, back):
+        prev, dist, q = {start: None}, {start: 0.0}, deque([start])
+        while q:
+            e = q.popleft()
+            if dist[e] > dmax:
+                continue
+            nb = list(e.getIncoming().keys()) if back else list(e.getOutgoing().keys())
+            for n in nb:
+                if n in prev or not ok(n):
+                    continue
+                prev[n] = e
+                dist[n] = dist[e] + n.getLength()
+                q.append(n)
+        return prev, dist
+    n = 0
+    with open(out_file, 'w') as f:
+        f.write('<routes>\n')
+        for eid in edges:
+            try:
+                e = net.getEdge(eid)
+            except Exception:
+                continue
+            vmin = e.getSpeed() * 0.75
+            ok = lambda x: ok0(x) and (x.getSpeed() >= vmin or x.getLaneNumber() >= max(2, e.getLaneNumber() - 1))   # 지점과 비슷한 큰길로만 이어서
+            pu, du = bfs(e, True)
+            pd, dd = bfs(e, False)
+            ups = [x for x in pu if dmin <= du[x] <= dmax] or [x for x in pu if x is not e] or [e]   # 도로망 끝에서 잘린 도로는 그 도로에서 출발
+            dns = [x for x in pd if dmin <= dd[x] <= dmax] or [x for x in pd if x is not e] or [e]
+            for k in range(per_edge):
+                o, d = rnd.choice(ups), rnd.choice(dns)
+                a = []
+                x = o
+                while x is not None:
+                    a.append(x.getID()); x = pu[x]
+                b = []
+                x = d
+                while x is not None and x is not e:
+                    b.append(x.getID()); x = pd[x]
+                route = a + b[::-1]
+                f.write('  <route id="t%d" edges="%s"/>\n' % (n, ' '.join(route)))
+                n += 1
+        f.write('</routes>\n')
+    return n
+
+
+def merge_routes(files, out):
+    """여러 경로 파일의 차량을 출발 시각 순으로 하나로 (id 겹치지 않게)"""
+    items = []
+    for i, fn in enumerate(files):
+        for ev, el in ET.iterparse(fn, events=('end',)):
+            if el.tag in ('vehicle', 'trip', 'flow'):
+                el.set('id', 'm%d_%s' % (i, el.get('id')))
+                items.append((float(el.get('depart', 0) or 0), ET.tostring(el, encoding='unicode')))
+                el.clear()
+    items.sort(key=lambda t: t[0])
+    with open(out, 'w') as f:
+        f.write('<routes>\n')
+        for _, x in items:
+            f.write('  ' + x.strip() + '\n')
+        f.write('</routes>\n')
+    return out
+
+
+def calibrate2(home, net, work, minutes, density, seed, counts, boost=None, gain=None, eboost=None, tag=''):
+    gain = gain or CALIB_GAIN
+    """배경 교통(randomTrips) + 지점별 부족분만 '지점을 지나는 경로'로 채움.
+       예전 방식(총량 상한 안에서 경로 고르기)은 큰길(시간당 2천 대 이상)에서 관측의 60%밖에 못 채웠음."""
+    spots = counts['spots']
+    T = minutes * 60
+    base = os.path.join(work, 'routes.rou.xml')
+    if not os.path.exists(base):
+        base = make_demand(home, net, work, minutes, density, seed)
+    bc = route_edge_counts(base)
+    rows, edges = [], []
+    for s in spots:
+        e = s['edges']
+        v = [s['in'], s['out']]
+        if len(e) == 2:
+            b0, b1 = bc.get(e[0], 0), bc.get(e[1], 0)
+            if (v[0] - v[1]) * (b0 - b1) < 0:
+                v = [v[1], v[0]]
+            pairs = [(e[0], v[0]), (e[1], v[1])]
+        else:
+            pairs = [(e[0], v[0] + v[1])]
+        for eid, vh in pairs:
+            need = vh * T / 3600.0 * ((boost or {}).get(s['id'], 1.0)) * ((eboost or {}).get(eid, 1.0)) * gain - bc.get(eid, 0)
+            TARGET[eid] = vh
+            rows.append((eid, max(0, need)))
+            edges.append(eid)
+    cand = os.path.join(work, 'through.rou.xml')
+    nr = through_routes(home, net, edges, cand, seed=seed) if not os.path.exists(cand) else 1
+    log('지점 통과 후보 경로 %d개' % nr)
+    if not nr:
+        return base
+    cnt_file = os.path.join(work, 'counts%s.xml' % tag)
+    with open(cnt_file, 'w') as f:
+        f.write('<data>\n  <interval id="obs" begin="0" end="%d">\n' % T)
+        for eid, c in rows:
+            f.write('    <edge id="%s" entered="%d"/>\n' % (eid, round(c)))
+        f.write('  </interval>\n</data>\n')
+    extra = os.path.join(work, 'extra%s.rou.xml' % tag)
+    run([sys.executable, os.path.join(home, 'tools', 'routeSampler.py'), '-r', cand, '-d', cnt_file,
+         '-o', extra, '--seed', str(seed), '-a', 'departLane="best" departSpeed="max"', '--prefix', 'x'])
+    out = os.path.join(work, 'calibrated%s.rou.xml' % tag)
+    return merge_routes([base, extra], out)
+
+def edge_rates(meandata, minutes):
+    tot = {}
+    for ev, el in ET.iterparse(meandata, events=('end',)):
+        if el.tag == 'edge':
+            tot[el.get('id')] = tot.get(el.get('id'), 0) + float(el.get('entered', 0))
+    return {k: v * 60.0 / minutes for k, v in tot.items()}
+
+
 def measure_spots(meandata, spots, warmup, minutes):
     """시뮬레이션 기록 구간의 지점별 시간당 통과 대수"""
     tot = {}
@@ -460,7 +645,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('gu', nargs='?', default=None, help='구 이름(강남구), 구코드(11680) 또는 all')
     ap.add_argument('--minutes', type=int, default=10, help='시뮬레이션 시간(분)')
-    ap.add_argument('--density', type=float, default=30, help='도로 1km당 시간당 차량 투입 수')
+    ap.add_argument('--density', type=float, default=None, help='도로 1km당 시간당 배경 차량 투입 수 (기본: 새 보정 12, 예전 보정 30)')
     ap.add_argument('--warmup', type=int, default=5, help='기록 전 워밍업(분) - 도로에 차가 찬 상태부터 기록')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--nodelink', default=None, help='MOCT_LINK.shp 가 있는 폴더')
@@ -479,8 +664,26 @@ def main():
     ap.add_argument('--fast', action='store_true', help='2차 보정 생략 (예측 시뮬레이션용, 시간 절반)')
     ap.add_argument('--fcd-dt', type=int, default=3, help='차량 위치 기록 간격(초). 크게 하면 파일이 작아짐')
     ap.add_argument('--fast-boost', type=float, default=1.8, help='--fast 일 때 관측 목표 배수')
+    ap.add_argument('--measure', type=int, default=None, help='교통량 재는 시간(분, 기본 10 · 예측(--fast) 8). 지도 기록(--minutes)보다 길면 앞부분은 재기만 함')
+    ap.add_argument('--passes', type=int, default=3, help='새 보정 반복 횟수(1차 포함). 4번째부터는 거의 안 줄어듦')
+    ap.add_argument('--gain', type=float, default=1.6, help='새 보정: 지점 목표 배수 (출발~지점 도착 지연 보정)')
+    ap.add_argument('--tr-min', type=float, default=300, help='새 보정: 지점 통과 경로 출발 거리 최소(m)')
+    ap.add_argument('--tr-max', type=float, default=1500, help='새 보정: 지점 통과 경로 출발 거리 최대(m)')
+    ap.add_argument('--no-unjam', dest='unjam', action='store_false', help='교차로 꽉 막힘 풀기 끄기 (기본: 15초 막으면 무시, 60초 정체 시 순간이동)')
+    ap.add_argument('--tls-act', action='store_true', help='신호를 감응식으로 (큰길 흐름 개선)')
+    ap.add_argument('--old-calib', dest='calib2', action='store_false', help='예전 보정 방식(총량 상한 안에서 경로 고르기)으로')
     ap.add_argument('--max-scale', type=float, default=1.2, help='투입 총량 상한 배수 (출퇴근 등 교통량 많은 시각은 크게)')
     a = ap.parse_args()
+    if a.density is None:
+        a.density = 12.0 if a.calib2 else 30.0
+    global TLS_ACT
+    TLS_ACT = a.tls_act
+    global TTT, JB, CALIB_GAIN, TR_DMIN, TR_DMAX, MEAS, PASSES
+    MEAS, PASSES = ((a.measure or (8 if a.fast else 10)) if a.calib2 else None), max(1, a.passes)
+    CALIB_GAIN, TR_DMIN, TR_DMAX = a.gain, a.tr_min, a.tr_max
+    if a.unjam:
+        TTT = 60
+        JB = ['--ignore-junction-blocker', '15']
     if not a.gu:
         a.gu = ask_gu(True)
     codes = list(GU.values()) if a.gu.lower() == 'all' else [GU.get(a.gu, a.gu)]
@@ -533,16 +736,42 @@ def main():
                 log('교통량 받기 실패 → 보정 없이 진행:', e)
                 counts = None
         spots = map_spots(home, net, counts['spots']) if counts and counts.get('spots') else []
+        M = max(a.minutes, MEAS or a.minutes) if a.calib2 else a.minutes   # 교통량 재는 시간(분)
         if spots:
             log('교통량 지점 %d곳 (%s %s시 기준)으로 보정' % (len(spots), counts['ymd'], counts['hh']))
             # --fast: 2차 보정 대신, 1차 보정에서 보통 모자라는 만큼(약 0.55배) 미리 목표를 높여 한 번에 맞춤
             pre = {s_['id']: a.fast_boost for s_ in spots} if a.fast else None
-            rou = calibrate(home, net, work, a.warmup + a.minutes, a.density, a.seed, dict(counts, spots=spots), pre)
+            rou = (calibrate2 if a.calib2 else calibrate)(home, net, work, a.warmup + (M if a.calib2 else a.minutes), a.density, a.seed, dict(counts, spots=spots), pre if not a.calib2 else None)
         else:
             log('이 구에는 교통량 지점이 없거나 받지 못함 → 도로 규모 기준 수요만 사용')
-            rou = make_demand(home, net, work, a.warmup + a.minutes, a.density, a.seed)
+            rou = make_demand(home, net, work, a.warmup + M, a.density, a.seed)
         fcd = simulate(home, net, rou, work, a.minutes, a.warmup)
-        if spots and a.fast:
+        if spots and a.calib2:
+            # 반복 보정: 도로마다 (관측 ÷ 지난번 시뮬)를 목표 배수에 곱해 다시 → 가장 오차 작은 결과를 씀
+            obs_sum = max(1, sum(s_['in'] + s_['out'] for s_ in spots))
+            res = measure_spots(os.path.join(work, 'meandata.xml'), spots, a.warmup, M)
+            best_err = sum(abs(r['sim'] - r['obs']) for r in res)
+            best_fcd = os.path.join(work, 'fcd_best.xml'); shutil.copy(fcd, best_fcd)
+            errs = [100 * best_err / obs_sum]
+            eb = {}
+            for k in range(2, PASSES + 1):
+                er = edge_rates(os.path.join(work, 'meandata.xml'), M)
+                for e in TARGET:
+                    if er.get(e, 0) > 30 and TARGET[e] > 0:
+                        eb[e] = min(3.0, max(0.3, eb.get(e, 1.0) * min(1.8, max(0.55, TARGET[e] / er[e]))))
+                rou_k = calibrate2(home, net, work, a.warmup + M, a.density, a.seed, dict(counts, spots=spots), None, eboost=eb, tag=str(k))
+                fcd = simulate(home, net, rou_k, work, a.minutes, a.warmup)
+                res_k = measure_spots(os.path.join(work, 'meandata.xml'), spots, a.warmup, M)
+                err_k = sum(abs(r['sim'] - r['obs']) for r in res_k)
+                errs.append(100 * err_k / obs_sum)
+                if err_k < best_err:
+                    best_err, res = err_k, res_k
+                    shutil.copy(fcd, best_fcd)
+            fcd = best_fcd
+            log('새 보정 오차 %s %%' % ' → '.join('%d' % e for e in errs))
+            meta['calib'] = {'ymd': counts['ymd'], 'hh': counts['hh'], 'spots': res}
+            log('보정 결과: 시뮬/관측 합계 %d%%' % (100 * sum(r['sim'] for r in res) / max(1, sum(r['obs'] for r in res))))
+        elif spots and a.fast:
             res = measure_spots(os.path.join(work, 'meandata.xml'), spots, a.warmup, a.minutes)
             meta['calib'] = {'ymd': counts['ymd'], 'hh': counts['hh'], 'spots': res}
             log('보정 결과(1차만): 시뮬/관측 합계 %d%%' % (100 * sum(r['sim'] for r in res) / max(1, sum(r['obs'] for r in res))))
@@ -571,7 +800,7 @@ def main():
         if PPL_HIT:
             meta['pplTop'] = [[k, int(v)] for k, v in sorted(PPL_HIT.items(), key=lambda t: -t[1])[:6]]
         out = a.out.replace('{gu}', code) if a.out else os.path.join(a.site, 'sim', code + '.json')
-        pack(fcd, out, code, a.minutes, net, a.warmup, meta, gu_shape_of(os.path.join(a.site, 'seoul_gu.json'), code))
+        pack(fcd, out, code, a.minutes, net, a.warmup + (M - a.minutes), meta, gu_shape_of(os.path.join(a.site, 'seoul_gu.json'), code))
         os.remove(fcd)
     log('완료. 3D 지도에서 [시뮬레이션] 레이어를 켜세요.')
 
