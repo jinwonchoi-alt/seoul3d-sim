@@ -665,7 +665,7 @@ def main():
     ap.add_argument('--fcd-dt', type=int, default=3, help='차량 위치 기록 간격(초). 크게 하면 파일이 작아짐')
     ap.add_argument('--fast-boost', type=float, default=1.8, help='--fast 일 때 관측 목표 배수')
     ap.add_argument('--measure', type=int, default=None, help='교통량 재는 시간(분, 기본 10 · 예측(--fast) 8). 지도 기록(--minutes)보다 길면 앞부분은 재기만 함')
-    ap.add_argument('--passes', type=int, default=3, help='새 보정 반복 횟수(1차 포함). 4번째부터는 거의 안 줄어듦')
+    ap.add_argument('--passes', type=int, default=None, help='새 보정 반복 횟수(1차 포함, 기본 3 · 예측(--fast) 1). 4번째부터는 거의 안 줄어듦')
     ap.add_argument('--gain', type=float, default=1.6, help='새 보정: 지점 목표 배수 (출발~지점 도착 지연 보정)')
     ap.add_argument('--tr-min', type=float, default=300, help='새 보정: 지점 통과 경로 출발 거리 최소(m)')
     ap.add_argument('--tr-max', type=float, default=1500, help='새 보정: 지점 통과 경로 출발 거리 최대(m)')
@@ -679,7 +679,7 @@ def main():
     global TLS_ACT
     TLS_ACT = a.tls_act
     global TTT, JB, CALIB_GAIN, TR_DMIN, TR_DMAX, MEAS, PASSES
-    MEAS, PASSES = ((a.measure or (8 if a.fast else 10)) if a.calib2 else None), max(1, a.passes)
+    MEAS, PASSES = ((a.measure or (8 if a.fast else 10)) if a.calib2 else None), max(1, a.passes or (1 if a.fast else 3))
     CALIB_GAIN, TR_DMIN, TR_DMAX = a.gain, a.tr_min, a.tr_max
     if a.unjam:
         TTT = 60
