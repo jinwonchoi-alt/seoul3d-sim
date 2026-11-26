@@ -599,7 +599,7 @@ def edge_rates(meandata, minutes):
     tot = {}
     for ev, el in ET.iterparse(meandata, events=('end',)):
         if el.tag == 'edge':
-            tot[el.get('id')] = tot.get(el.get('id'), 0) + float(el.get('entered', 0))
+            tot[el.get('id')] = tot.get(el.get('id'), 0) + float(el.get('entered', 0)) + float(el.get('departed', 0))   # 도로망 끝에서 잘려 들어오는 길이 없는 도로(관악터널 등)는 차가 그 도로에서 출발하므로 출발 대수도 셈
     return {k: v * 60.0 / minutes for k, v in tot.items()}
 
 
@@ -608,7 +608,7 @@ def measure_spots(meandata, spots, warmup, minutes):
     tot = {}
     for ev, el in ET.iterparse(meandata, events=('end',)):
         if el.tag == 'edge':
-            tot[el.get('id')] = tot.get(el.get('id'), 0) + float(el.get('entered', 0))
+            tot[el.get('id')] = tot.get(el.get('id'), 0) + float(el.get('entered', 0)) + float(el.get('departed', 0))   # 도로망 끝에서 잘려 들어오는 길이 없는 도로(관악터널 등)는 차가 그 도로에서 출발하므로 출발 대수도 셈
     res = []
     for s in spots:
         simv = sum(tot.get(e, 0) for e in s['edges']) * 60.0 / minutes
