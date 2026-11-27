@@ -142,7 +142,7 @@ PPL_HIT = {}      # 이번 구에서 반영된 인구 구역 {이름: 인구}
 
 
 def load_ppl(ppl_file, hotspots_file, at=None):
-    """at 을 주면 그 시각의 예측 인구(ppl_all.json 의 f)를 씀. 예측이 없는 구역은 빼고 계산"""
+    """at 을 주면 그 시각의 예측 인구(ppl_all.json 의 f)를 씀. 그 시각 예측이 없는 구역은 가장 가까운 예측 시각(90분 안), 그것도 없으면 지금 인구"""
     from shapely.geometry import shape
     d = json.load(open(ppl_file, encoding='utf-8'))
     areas = d.get('areas', d)
@@ -152,8 +152,19 @@ def load_ppl(ppl_file, hotspots_file, at=None):
         if not a:
             continue
         if at:
-            v = (a.get('f') or {}).get(at)
-            p = float(v[0]) if v else 0
+            f_ = a.get('f') or {}
+            v = f_.get(at)
+            if not v and f_:
+                # 지역마다 갱신 시각이 달라 그 시각 예측이 없으면 가장 가까운 예측 시각(90분 안) 값을 씀
+                try:
+                    import datetime as _dt
+                    t0 = _dt.datetime.strptime(at[:16], '%Y-%m-%d %H:%M')
+                    k = min(f_, key=lambda x: abs((_dt.datetime.strptime(x[:16], '%Y-%m-%d %H:%M') - t0).total_seconds()))
+                    if abs((_dt.datetime.strptime(k[:16], '%Y-%m-%d %H:%M') - t0).total_seconds()) <= 5400:
+                        v = f_[k]
+                except Exception:
+                    v = None
+            p = float(v[0]) if v else float(a.get('p', 0))   # 그래도 없으면 지금 인구
         else:
             p = float(a.get('p', 0))
         if p > 0:
@@ -257,7 +268,7 @@ def simulate(home, net, rou, work, minutes, warmup):
 
 
 def pack(fcd, out_json, code, minutes, net, warmup, meta=None, gu_shape=None):
-    """궤적 압축: 차량별 [시작초, lon*1e5, lat*1e5, 이후 (dlon,dlat,속도km/h) 반복], 2초 간격"""
+    """궤적 압축: 차량별 [시작초, lon*1e5, lat*1e5, 이후 (dlon,dlat,속도km/h) 반복], FCD_DT 간격(지금 3초, 예측 6초)"""
     tracks = {}
     for ev, el in ET.iterparse(fcd, events=('end',)):
         if el.tag != 'timestep':
@@ -353,10 +364,18 @@ def fetch_counts(api, gu_json, code, ymd=None, hh=None):
     for back in (1, 2, 3, 24):
         t = now - datetime.timedelta(hours=back)
         tries.append((t.strftime('%Y%m%d'), t.strftime('%H')))
+    # 시점마다 자료가 있는 지점 수를 세고, 가장 많은 시점의 80% 이상 채워진 시점 중 가장 최근 것을 씀
+    cands = []
     for y, h in tries:
-        res = get_json('%s/api/vol?spots=%s&ymd=%s&hh=%s' % (api, ','.join(s['id'] for s in spots), y, h))
+        try:
+            res = get_json('%s/api/vol?spots=%s&ymd=%s&hh=%s' % (api, ','.join(s['id'] for s in spots), y, h))
+        except Exception as e:
+            log('교통량 조회 실패 %s %s시: %s' % (y, h, e)); continue
         vol = {r['id']: r for r in res['rows'] if not r.get('error')}
-        if sum(v['in'] + v['out'] for v in vol.values()) > 0:
+        cands.append((sum(1 for v in vol.values() if v['in'] + v['out'] > 0), vol, y, h))
+    best = max([c[0] for c in cands] or [0])
+    for n, vol, y, h in cands:
+        if best and n >= best * 0.8:
             for s in spots:
                 v = vol.get(s['id'], {})
                 s['in'], s['out'] = v.get('in', 0), v.get('out', 0)
@@ -579,8 +598,10 @@ def calibrate2(home, net, work, minutes, density, seed, counts, boost=None, gain
             rows.append((eid, max(0, need)))
             edges.append(eid)
     cand = os.path.join(work, 'through.rou.xml')
-    nr = through_routes(home, net, edges, cand, seed=seed) if not os.path.exists(cand) else 1
-    log('지점 통과 후보 경로 %d개' % nr)
+    if os.path.exists(cand):
+        nr = 1; log('지점 통과 후보 경로: 앞 회차 것 다시 씀')
+    else:
+        nr = through_routes(home, net, edges, cand, seed=seed); log('지점 통과 후보 경로 %d개' % nr)
     if not nr:
         return base
     cnt_file = os.path.join(work, 'counts%s.xml' % tag)

@@ -32,15 +32,29 @@ def main():
         backs = [at - datetime.timedelta(days=d) for d in (7, 14, 1)]
     else:
         backs = [now - datetime.timedelta(hours=b) for b in (1, 2, 3, 24)]
+    # 시점마다 자료가 있는 지점 수를 세고, 가장 많은 시점의 80% 이상 채워진 시점 중 가장 최근 것을 씀
+    # (1시간 전 자료가 일부 지점만 올라온 상태에서 그 시점을 고르면 나머지 지점이 빠지기 때문)
+    cands = []
     for t in backs:
         y, h = t.strftime('%Y%m%d'), t.strftime('%H')
-        got = {}
+        got, fails = {}, 0
         for i in range(0, len(spots), 40):
             ids = ','.join(s['id'] for s in spots[i:i + 40])
-            for r in A.get_json('%s/api/vol?spots=%s&ymd=%s&hh=%s' % (a.api, ids, y, h))['rows']:
+            try:
+                rows = A.get_json('%s/api/vol?spots=%s&ymd=%s&hh=%s' % (a.api, ids, y, h))['rows']
+            except Exception as e:
+                fails += 1
+                print('  교통량 조회 실패 %s %s시 (%d번째 묶음): %s' % (y, h, i // 40 + 1, e))
+                continue
+            for r in rows:
                 if not r.get('error'):
                     got[r['id']] = r
-        if sum(r['in'] + r['out'] for r in got.values()) > 0:
+        n = sum(1 for r in got.values() if r['in'] + r['out'] > 0)
+        print('  %s %s시: 자료 있는 지점 %d곳%s' % (y, h, n, (' (조회 실패 %d번)' % fails) if fails else ''))
+        cands.append((n, got, y, h))
+    best = max([c[0] for c in cands] or [0])
+    for n, got, y, h in cands:
+        if best and n >= best * 0.8:
             vol, ymd, hh = got, y, h
             break
     out = {}

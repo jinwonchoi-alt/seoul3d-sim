@@ -8,6 +8,7 @@ import sim_auto as A
 
 
 def one(api, cd):
+    err = None
     for _ in range(2):
         try:
             a = A.get_json('%s/api/seoul-ppltn?area=%s' % (api, cd))['SeoulRtd.citydata_ppltn'][0]
@@ -19,8 +20,9 @@ def one(api, cd):
                     pass
             return cd, {'nm': a['AREA_NM'], 'p': (float(a['AREA_PPLTN_MIN']) + float(a['AREA_PPLTN_MAX'])) / 2,
                         'lvl': a['AREA_CONGEST_LVL'], 't': a.get('PPLTN_TIME'), 'f': f}
-        except Exception:
-            pass
+        except Exception as e:
+            err = e
+    print('  인구 조회 실패 %s: %s' % (cd, err))
     return cd, None
 
 
@@ -37,7 +39,10 @@ def main():
     with ThreadPoolExecutor(6) as ex:
         got = dict(ex.map(lambda c: one(a.api, c), codes))
     areas = {k: v for k, v in got.items() if v}
-    t = max([v['t'] for v in areas.values() if v.get('t')] or [(datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')])
+    # 대표 시각: 가장 많은 지역이 같은 시각으로 찍힌 값 (한두 곳만 늦게 찍혀도 전체 기준이 흔들리지 않게)
+    from collections import Counter
+    ts = [v['t'] for v in areas.values() if v.get('t')]
+    t = Counter(ts).most_common(1)[0][0] if ts else (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M')
     fc = sorted({k for v in areas.values() for k in (v.get('f') or {})})
     json.dump({'t': t, 'fc': fc, 'areas': areas}, open(a.out, 'w', encoding='utf-8'), ensure_ascii=False)
     print('인구 %d/%d곳 (%s 기준, 예측 %s ~ %s) → %s' % (len(areas), len(codes), t, fc[0] if fc else '-', fc[-1] if fc else '-', a.out))
