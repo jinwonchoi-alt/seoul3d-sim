@@ -531,7 +531,9 @@ def through_routes(home, net_file, edges, out_file, per_edge=80, seed=1, dmin=No
             except Exception:
                 continue
             vmin = e.getSpeed() * 0.75
-            ok = lambda x: ok0(x) and (x.getSpeed() >= vmin or x.getLaneNumber() >= max(2, e.getLaneNumber() - 1))   # 지점과 비슷한 큰길로만 이어서
+            # 지점과 비슷한 큰길로만 이어서. 1차로 도로는 빼기(지점 도로가 1차로일 때만 허용)
+            # (11/27 서초: 양재대로 경로의 96%가 1차로 구간 두 곳으로 몰려 꽉 막힘 → 양재대로 33→59%, 반포대교 62→96%, 6개 구 평균 오차 18→17%)
+            ok = lambda x: ok0(x) and (x.getLaneNumber() >= 2 or e.getLaneNumber() == 1) and (x.getSpeed() >= vmin or x.getLaneNumber() >= max(2, e.getLaneNumber() - 1))
             pu, du = bfs(e, True)
             pd, dd = bfs(e, False)
             ups = [x for x in pu if dmin <= du[x] <= dmax] or [x for x in pu if x is not e] or [e]   # 도로망 끝에서 잘린 도로는 그 도로에서 출발
